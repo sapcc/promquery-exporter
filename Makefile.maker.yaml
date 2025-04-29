@@ -1,0 +1,7 @@
+metadata:
+    url: https://github.com/sapcc/promquery-exporter
+
+binaries:
+  - name:        promquery
+    fromPackage: .
+    installTo:   bin/
