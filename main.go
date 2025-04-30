@@ -67,6 +67,7 @@ type MetricConfig struct {
 	ExportName   string            `yaml:"export_name"`
 	Help         string            `yaml:"help"`
 	StaticLabels map[string]string `yaml:"static_labels,omitempty"`
+	LabelRules   []LabelRule       `yaml:"label_rules,omitempty"`
 }
 
 // LabelRule defines a rule for manipulating labels globally across all metrics.
@@ -88,18 +89,18 @@ server, applies label rules, and re-exports them.
 */
 func main() {
 	// --- Configuration Loading ---
-	appConfig, err := loadConfig(configFile) // Changed variable name to reflect it holds the whole config
+	appConfig, err := loadConfig(configFile)
 	if err != nil {
 		log.Fatalf("Error loading configuration from %q: %v", configFile, err)
 	}
-	if len(appConfig.Metrics) == 0 { // Check the Metrics slice within the config
+	if len(appConfig.Metrics) == 0 {
 		log.Fatalf("No metric definitions found in config file %q. Exiting.", configFile)
 	}
 	log.Printf("Successfully loaded %d metric definitions and %d label rules from %s",
 		len(appConfig.Metrics), len(appConfig.LabelRules), configFile)
 
 	// --- Prometheus Client Setup ---
-	promCfg := promquery.Config{ // Renamed variable for clarity
+	promCfg := promquery.Config{
 		ServerURL:                promServerURL,
 		ClientCertificatePath:    certPath,
 		ClientCertificateKeyPath: certKeyPath,
@@ -169,10 +170,10 @@ func collectMetrics(ctx context.Context, client promquery.Client, appConfig Conf
 	log.Println("Starting metrics collection cycle...")
 
 	for i := range appConfig.Metrics {
-		cfg := appConfig.Metrics[i]
+		metricCfg := appConfig.Metrics[i]
 		go func() {
 			defer wg.Done()
-			processSingleMetric(ctx, client, cfg, appConfig.LabelRules)
+			processSingleMetric(ctx, client, metricCfg)
 		}()
 	}
 
@@ -181,7 +182,7 @@ func collectMetrics(ctx context.Context, client promquery.Client, appConfig Conf
 }
 
 // processSingleMetric handles the querying and updating for one metric definition.
-func processSingleMetric(ctx context.Context, client promquery.Client, cfg MetricConfig, rules []LabelRule) { // Added rules param
+func processSingleMetric(ctx context.Context, client promquery.Client, cfg MetricConfig) {
 	timeoutInterval := 60 * time.Second
 	if scrapeInterval < timeoutInterval {
 		timeoutInterval = scrapeInterval - 5*time.Second
@@ -206,6 +207,7 @@ func processSingleMetric(ctx context.Context, client promquery.Client, cfg Metri
 		}
 		return
 	}
+	rules := cfg.LabelRules
 	registerOrUpdateMetric(cfg, vector, rules)
 }
 
@@ -348,6 +350,17 @@ func loadConfig(path string) (Config, error) {
 		return Config{}, fmt.Errorf("failed to parse YAML config file %q: %w", path, err)
 	}
 
+	// Validate LabelRules
+	validatedRules := make([]LabelRule, 0, len(cfg.LabelRules))
+	for _, rule := range cfg.LabelRules {
+		if !validateLabelRule(rule) {
+			log.Printf("WARN: Invalid label rule %v in config file %q. Skipping.", rule, path)
+		} else {
+			validatedRules = append(validatedRules, rule)
+		}
+	}
+	cfg.LabelRules = validatedRules
+
 	// --- Validation ---
 	validatedMetrics := make([]MetricConfig, 0, len(cfg.Metrics))
 	for i, metricCfg := range cfg.Metrics {
@@ -364,37 +377,42 @@ func loadConfig(path string) (Config, error) {
 			log.Printf("WARN: Config metrics item %d (%s) in %q is missing 'help' field. Using default.", i, metricCfg.ExportName, path)
 			metricCfg.Help = fmt.Sprintf("%s exported metric %s", exporterName, metricCfg.ExportName)
 		}
+
+		// validate metric's individual label rules and merge with global rules
+		metricLabelRules := validatedRules
+		for _, rule := range metricCfg.LabelRules {
+			if !validateLabelRule(rule) {
+				log.Printf("WARN: Invalid label rule %v in config file %q for metric %q. Skipping.", rule, path, metricCfg.ExportName)
+			} else {
+				metricLabelRules = append(metricLabelRules, rule)
+			}
+		}
+		metricCfg.LabelRules = metricLabelRules
+
 		if valid {
 			validatedMetrics = append(validatedMetrics, metricCfg)
 		}
 	}
 	cfg.Metrics = validatedMetrics
 
-	// Validate LabelRules
-	validatedRules := make([]LabelRule, 0, len(cfg.LabelRules))
-	for i, rule := range cfg.LabelRules {
-		valid := true
-		switch rule.Type {
-		case DropLabelRule:
-			if rule.LabelName == "" && rule.LabelPrefix == "" {
-				log.Printf("WARN: Config label_rules item %d in %q is missing both 'label_name' and 'label_prefix'. Skipping rule.", i, path)
-				valid = false
-			}
-		case FillLableRule:
-			if rule.LabelName == "" {
-				log.Printf("WARN: Config label_rules item %d in %q is missing 'label_name'. Skipping rule.", i, path)
-				valid = false
-			}
-		default:
-			log.Printf("WARN: Config label_rules item %d in %q has unknown or unsupported type %q. Skipping rule.", i, path, rule.Type)
-			valid = false
-		}
-		if valid {
-			validatedRules = append(validatedRules, rule)
-		}
-	}
-	cfg.LabelRules = validatedRules
 	return cfg, nil
+}
+
+// move label rule validation to a function
+func validateLabelRule(rule LabelRule) bool {
+	switch rule.Type {
+	case DropLabelRule:
+		if rule.LabelName == "" && rule.LabelPrefix == "" {
+			return false
+		}
+	case FillLableRule:
+		if rule.LabelName == "" {
+			return false
+		}
+	default:
+		return false
+	}
+	return true
 }
 
 func init() {
